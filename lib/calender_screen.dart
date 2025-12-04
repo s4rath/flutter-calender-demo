@@ -1,4 +1,4 @@
-
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:table_calendar/table_calendar.dart';
@@ -15,35 +15,175 @@ class _CalendarScreenState extends State<CalendarScreen> {
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
 
-  // Sample events - Replace this with your actual data source
-  final Map<DateTime, List<Event>> _events = {
-    DateTime.utc(2025, 12, 5): [
-      Event('Team Meeting', '10:00 AM', Colors.blue),
-      Event('Project Review', '2:00 PM', Colors.green),
-    ],
-    DateTime.utc(2025, 12, 10): [
-      Event('Client Presentation', '11:00 AM', Colors.orange),
-    ],
-    DateTime.utc(2025, 12, 15): [
-      Event('Birthday Party', '6:00 PM', Colors.pink),
-    ],
-    DateTime.utc(2025, 12, 20): [
-      Event('Dentist Appointment', '3:00 PM', Colors.red),
-    ],
-    DateTime.utc(2025, 12, 25): [
-      Event('Christmas Celebration', 'All Day', Colors.red),
-    ],
-    DateTime.utc(2025, 1, 1): [
-      Event('New Year Party', '11:00 PM', Colors.purple),
-    ],
-  };
+  // Cache for storing events by month to avoid repeated queries
+  final Map<String, Map<DateTime, List<Event>>> _monthlyEventsCache = {};
+
+  // Current month's events
+  Map<DateTime, List<Event>> _currentMonthEvents = {};
+
+  // Stream subscription for real-time updates
+  Stream<QuerySnapshot>? _eventsStream;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadEventsForMonth(_focusedDay);
+    // addSampleEvents();
+  }
+
+
+  // Future<void> addSampleEvents() async {
+  //   final firestore = FirebaseFirestore.instance;
+
+  //   await firestore.collection('events').add({
+  //     'title': 'Team Meeting',
+  //     'time': '10:00 AM',
+  //     'date': Timestamp.fromDate(DateTime(2025, 12, 5)),
+  //     'color': 'blue',
+  //     'description': 'Monthly team sync',
+  //   });
+
+  //   await firestore.collection('events').add({
+  //     'title': 'Client Presentation',
+  //     'time': '2:00 PM',
+  //     'date': Timestamp.fromDate(DateTime(2025, 12, 15)),
+  //     'color': 'orange',
+  //     'description': 'Q4 Review',
+  //   });
+
+  //   await firestore.collection('events').add({
+  //     'title': 'Client Presentation',
+  //     'time': '2:00 PM',
+  //     'date': Timestamp.fromDate(DateTime(2026, 1, 15)),
+  //     'color': 'orange',
+  //     'description': 'Q4 Review',
+  //   });
+
+  //   await firestore.collection('events').add({
+  //     'title': 'Client Presentation',
+  //     'time': '2:00 PM',
+  //     'date': Timestamp.fromDate(DateTime(2026, 1, 4)),
+  //     'color': 'orange',
+  //     'description': 'Q4 Review',
+  //   });
+  // }
+
+  // Generate a unique key for each month
+  String _getMonthKey(DateTime date) {
+    return '${date.year}-${date.month}';
+  }
+
+  // Load events for a specific month from Firestore
+  void _loadEventsForMonth(DateTime month) {
+    final monthKey = _getMonthKey(month);
+
+    // Check if already cached
+    if (_monthlyEventsCache.containsKey(monthKey)) {
+      setState(() {
+        _currentMonthEvents = _monthlyEventsCache[monthKey]!;
+      });
+      return;
+    }
+
+    // Calculate month range
+    final firstDayOfMonth = DateTime(month.year, month.month, 1);
+    final lastDayOfMonth = DateTime(month.year, month.month + 1, 0, 23, 59, 59);
+
+    // Create stream for this month's events
+    _eventsStream = FirebaseFirestore.instance
+        .collection('events')
+        .where(
+          'date',
+          isGreaterThanOrEqualTo: Timestamp.fromDate(firstDayOfMonth),
+        )
+        .where('date', isLessThanOrEqualTo: Timestamp.fromDate(lastDayOfMonth))
+        .snapshots();
+
+    // Listen to stream and update events
+    _eventsStream!.listen((snapshot) {
+      final events = <DateTime, List<Event>>{};
+
+      for (var doc in snapshot.docs) {
+        final data = doc.data() as Map<String, dynamic>?;
+        if (data == null || data['date'] == null) {
+          continue; // Skip documents without a valid date
+        }
+
+        final timestamp = data['date'] as Timestamp;
+        final eventDate = DateTime.utc(
+          timestamp.toDate().year,
+          timestamp.toDate().month,
+          timestamp.toDate().day,
+        );
+
+        final event = Event(
+          id: doc.id,
+          title: data['title'] ?? 'Untitled Event',
+          time: data['time'] ?? '',
+          color: _getColorFromString(data['color'] ?? 'blue'),
+          description: data['description'] ?? '',
+        );
+
+        if (events[eventDate] == null) {
+          events[eventDate] = [];
+        }
+        events[eventDate]!.add(event);
+      }
+
+      setState(() {
+        _currentMonthEvents = events;
+        _monthlyEventsCache[monthKey] = events; // Cache the result
+      });
+    });
+  }
+
+  // Convert color string to Color object
+  Color _getColorFromString(String colorStr) {
+    switch (colorStr.toLowerCase()) {
+      case 'red':
+        return Colors.red;
+      case 'blue':
+        return Colors.blue;
+      case 'green':
+        return Colors.green;
+      case 'orange':
+        return Colors.orange;
+      case 'purple':
+        return Colors.purple;
+      case 'pink':
+        return Colors.pink;
+      default:
+        return Colors.blue;
+    }
+  }
 
   // Get events for a specific day
   List<Event> _getEventsForDay(DateTime day) {
-    return _events[DateTime.utc(day.year, day.month, day.day)] ?? [];
+    final key = DateTime.utc(day.year, day.month, day.day);
+    return _currentMonthEvents[key] ?? [];
   }
 
-  // Show event details or warning
+  // Called when user swipes to a different month
+  void _onPageChanged(DateTime focusedDay) {
+    setState(() {
+      _focusedDay = focusedDay;
+    });
+
+    // Load events for the new month
+    _loadEventsForMonth(focusedDay);
+
+    // Show loading indicator
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Loading events for ${DateFormat('MMMM yyyy').format(focusedDay)}',
+        ),
+        duration: const Duration(seconds: 1),
+      ),
+    );
+  }
+
+  // Handle day selection
   void _onDaySelected(DateTime selectedDay, DateTime focusedDay) {
     setState(() {
       _selectedDay = selectedDay;
@@ -53,10 +193,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
     final events = _getEventsForDay(selectedDay);
 
     if (events.isEmpty) {
-      // Show warning when no events
       _showNoEventsDialog(selectedDay);
     } else {
-      // Show event details
       _showEventsDialog(selectedDay, events);
     }
   }
@@ -109,7 +247,20 @@ class _CalendarScreenState extends State<CalendarScreen> {
                     event.title,
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
-                  subtitle: Text(event.time),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(event.time),
+                      if (event.description.isNotEmpty)
+                        Text(
+                          event.description,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               );
             },
@@ -129,9 +280,46 @@ class _CalendarScreenState extends State<CalendarScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Event Calendar'),
+        title: const Text('Firebase Event Calendar'),
         centerTitle: true,
         elevation: 2,
+        actions: [
+          // Show current month and cache info
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            onPressed: () {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Cache Info'),
+                  content: Text(
+                    'Cached months: ${_monthlyEventsCache.length}\n'
+                    'Current month: ${DateFormat('MMMM yyyy').format(_focusedDay)}\n'
+                    'Events this month: ${_currentMonthEvents.values.fold(0, (sum, list) => sum + list.length)}',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _monthlyEventsCache.clear();
+                        });
+                        Navigator.pop(context);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Cache cleared')),
+                        );
+                      },
+                      child: const Text('Clear Cache'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('Close'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -150,11 +338,9 @@ class _CalendarScreenState extends State<CalendarScreen> {
                 _calendarFormat = format;
               });
             },
-            onPageChanged: (focusedDay) {
-              _focusedDay = focusedDay;
-            },
+            onPageChanged:
+                _onPageChanged, // This is key for month swipe detection
             eventLoader: _getEventsForDay,
-            // Styling
             calendarStyle: CalendarStyle(
               todayDecoration: BoxDecoration(
                 color: Colors.blue.withOpacity(0.5),
@@ -175,7 +361,6 @@ class _CalendarScreenState extends State<CalendarScreen> {
               titleCentered: true,
               formatButtonShowsNext: false,
             ),
-            // Custom event markers
             calendarBuilders: CalendarBuilders(
               markerBuilder: (context, day, events) {
                 if (events.isNotEmpty) {
@@ -201,14 +386,14 @@ class _CalendarScreenState extends State<CalendarScreen> {
             padding: const EdgeInsets.all(16.0),
             child: Card(
               color: Colors.blue.shade50,
-              child: const Padding(
+              child: Padding(
                 padding: EdgeInsets.all(16.0),
                 child: Column(
                   children: [
-                    Icon(Icons.info_outline, color: Colors.blue, size: 32),
+                    Icon(Icons.cloud_done, color: Colors.blue, size: 32),
                     SizedBox(height: 8),
                     Text(
-                      'Tap on any date to view events',
+                      'Connected to Firebase',
                       style: TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.w500,
@@ -217,13 +402,13 @@ class _CalendarScreenState extends State<CalendarScreen> {
                     ),
                     SizedBox(height: 4),
                     Text(
-                      'Dates with red dots have events scheduled',
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: Colors.grey,
-                      ),
+                      'Swipe to load events for different months',
+                      style: TextStyle(fontSize: 14, color: Colors.grey),
                       textAlign: TextAlign.center,
                     ),
+                    // ElevatedButton(onPressed: (){
+                    //   addSampleEvents();
+                    // }, child: Text("Add."))
                   ],
                 ),
               ),
@@ -237,9 +422,17 @@ class _CalendarScreenState extends State<CalendarScreen> {
 
 // Event model class
 class Event {
+  final String id;
   final String title;
   final String time;
   final Color color;
+  final String description;
 
-  Event(this.title, this.time, this.color);
+  Event({
+    required this.id,
+    required this.title,
+    required this.time,
+    required this.color,
+    required this.description,
+  });
 }
