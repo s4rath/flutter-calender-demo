@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -15,22 +16,27 @@ class _CalendarScreenState extends State<CalendarScreen> {
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
 
-  // Cache for storing events by month to avoid repeated queries
-  final Map<String, Map<DateTime, List<Event>>> _monthlyEventsCache = {};
+  /// monthKey -> {
+  ///   "data": Map<DateTime, List<Event>>
+  ///   "timestamp": DateTime (for cache freshness)
+  /// }
+  final Map<String, Map<String, dynamic>> _cache = {};
 
-  // Current month's events
   Map<DateTime, List<Event>> _currentMonthEvents = {};
 
-  // Stream subscription for real-time updates
-  Stream<QuerySnapshot>? _eventsStream;
 
   @override
   void initState() {
     super.initState();
-    _loadEventsForMonth(_focusedDay);
-    // addSampleEvents();
+    _loadMonth(_focusedDay);
   }
 
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
+  String _monthKey(DateTime d) => "${d.year}-${d.month}";
 
   // Future<void> addSampleEvents() async {
   //   final firestore = FirebaseFirestore.instance;
@@ -67,210 +73,151 @@ class _CalendarScreenState extends State<CalendarScreen> {
   //     'description': 'Q4 Review',
   //   });
   // }
+  Future<void> _loadMonth(DateTime month) async {
+    final key = _monthKey(month);
 
-  // Generate a unique key for each month
-  String _getMonthKey(DateTime date) {
-    return '${date.year}-${date.month}';
-  }
+    // ---- CACHE CHECK ----
+    if (_cache.containsKey(key)) {
+      final timestamp = _cache[key]!["timestamp"] as DateTime;
 
-  // Load events for a specific month from Firestore
-  void _loadEventsForMonth(DateTime month) {
-    final monthKey = _getMonthKey(month);
-
-    // Check if already cached
-    if (_monthlyEventsCache.containsKey(monthKey)) {
-      setState(() {
-        _currentMonthEvents = _monthlyEventsCache[monthKey]!;
-      });
-      return;
+      // Cache expires after 10 minutes
+      if (DateTime.now().difference(timestamp).inMinutes < 10) {
+        setState(() => _currentMonthEvents = _cache[key]!["data"]);
+        return;
+      }
     }
 
-    // Calculate month range
-    final firstDayOfMonth = DateTime(month.year, month.month, 1);
-    final lastDayOfMonth = DateTime(month.year, month.month + 1, 0, 23, 59, 59);
+    // ---- FIRESTORE QUERY ----
+    final start = DateTime(month.year, month.month, 1);
+    final end = DateTime(month.year, month.month + 1, 0, 23, 59, 59);
 
-    // Create stream for this month's events
-    _eventsStream = FirebaseFirestore.instance
-        .collection('events')
-        .where(
-          'date',
-          isGreaterThanOrEqualTo: Timestamp.fromDate(firstDayOfMonth),
-        )
-        .where('date', isLessThanOrEqualTo: Timestamp.fromDate(lastDayOfMonth))
-        .snapshots();
+    final query = await FirebaseFirestore.instance
+        .collection("events")
+        .where("date", isGreaterThanOrEqualTo: Timestamp.fromDate(start))
+        .where("date", isLessThanOrEqualTo: Timestamp.fromDate(end))
+        .orderBy("date")
+        .get();
 
-    // Listen to stream and update events
-    _eventsStream!.listen((snapshot) {
-      final events = <DateTime, List<Event>>{};
+    final result = <DateTime, List<Event>>{};
 
-      for (var doc in snapshot.docs) {
-        final data = doc.data() as Map<String, dynamic>?;
-        if (data == null || data['date'] == null) {
-          continue; // Skip documents without a valid date
-        }
+    for (var doc in query.docs) {
+      final data = doc.data();
+      if (!data.containsKey("date")) continue;
 
-        final timestamp = data['date'] as Timestamp;
-        final eventDate = DateTime.utc(
-          timestamp.toDate().year,
-          timestamp.toDate().month,
-          timestamp.toDate().day,
-        );
+      final ts = (data["date"] as Timestamp).toDate();
+      final date = DateTime(ts.year, ts.month, ts.day);
 
-        final event = Event(
-          id: doc.id,
-          title: data['title'] ?? 'Untitled Event',
-          time: data['time'] ?? '',
-          color: _getColorFromString(data['color'] ?? 'blue'),
-          description: data['description'] ?? '',
-        );
+      final event = Event(
+        id: doc.id,
+        title: data["title"] ?? "Untitled",
+        time: data["time"] ?? "",
+        color: _color(data["color"] ?? "blue"),
+        description: data["description"] ?? "",
+      );
 
-        if (events[eventDate] == null) {
-          events[eventDate] = [];
-        }
-        events[eventDate]!.add(event);
-      }
+      result.putIfAbsent(date, () => []);
+      result[date]!.add(event);
+    }
 
-      setState(() {
-        _currentMonthEvents = events;
-        _monthlyEventsCache[monthKey] = events; // Cache the result
-      });
-    });
+    // ---- UPDATE UI + CACHE ----
+    setState(() => _currentMonthEvents = result);
+
+    _cache[key] = {
+      "data": result,
+      "timestamp": DateTime.now(),
+    };
   }
 
-  // Convert color string to Color object
-  Color _getColorFromString(String colorStr) {
-    switch (colorStr.toLowerCase()) {
-      case 'red':
+  Color _color(String name) {
+    switch (name.toLowerCase()) {
+      case "red":
         return Colors.red;
-      case 'blue':
-        return Colors.blue;
-      case 'green':
+      case "green":
         return Colors.green;
-      case 'orange':
+      case "orange":
         return Colors.orange;
-      case 'purple':
+      case "purple":
         return Colors.purple;
-      case 'pink':
+      case "pink":
         return Colors.pink;
       default:
         return Colors.blue;
     }
   }
 
-  // Get events for a specific day
-  List<Event> _getEventsForDay(DateTime day) {
-    final key = DateTime.utc(day.year, day.month, day.day);
+  List<Event> _eventsForDay(DateTime day) {
+    final key = DateTime(day.year, day.month, day.day);
     return _currentMonthEvents[key] ?? [];
   }
 
-  // Called when user swipes to a different month
-  void _onPageChanged(DateTime focusedDay) {
-    setState(() {
-      _focusedDay = focusedDay;
-    });
+  void _onPageChanged(DateTime focused) {
+    _focusedDay = focused;
+    _loadMonth(focused);
 
-    // Load events for the new month
-    _loadEventsForMonth(focusedDay);
-
-    // Show loading indicator
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
-          'Loading events for ${DateFormat('MMMM yyyy').format(focusedDay)}',
-        ),
+        content: Text("Loading ${DateFormat('MMMM yyyy').format(focused)}"),
         duration: const Duration(seconds: 1),
       ),
     );
   }
 
-  // Handle day selection
-  void _onDaySelected(DateTime selectedDay, DateTime focusedDay) {
+  void _onDaySelected(DateTime selected, DateTime focused) {
     setState(() {
-      _selectedDay = selectedDay;
-      _focusedDay = focusedDay;
+      _selectedDay = selected;
+      _focusedDay = focused;
     });
 
-    final events = _getEventsForDay(selectedDay);
+    final events = _eventsForDay(selected);
 
     if (events.isEmpty) {
-      _showNoEventsDialog(selectedDay);
+      _noEvents(selected);
     } else {
-      _showEventsDialog(selectedDay, events);
+      _showEvents(selected, events);
     }
   }
 
-  // Dialog for when no events exist
-  void _showNoEventsDialog(DateTime day) {
+  void _noEvents(DateTime day) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        icon: const Icon(Icons.event_busy, color: Colors.orange, size: 48),
-        title: const Text('No Events'),
+      builder: (_) => AlertDialog(
+        icon: const Icon(Icons.event_busy, size: 40, color: Colors.orange),
+        title: const Text("No Events"),
         content: Text(
-          'There are no events scheduled for ${DateFormat('MMMM d, yyyy').format(day)}',
+          "No events on ${DateFormat('MMMM d, yyyy').format(day)}",
           textAlign: TextAlign.center,
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("OK"))
         ],
       ),
     );
   }
 
-  // Dialog showing event details
-  void _showEventsDialog(DateTime day, List<Event> events) {
+  void _showEvents(DateTime day, List<Event> events) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text(
-          DateFormat('MMMM d, yyyy').format(day),
-          style: const TextStyle(fontSize: 18),
-        ),
+      builder: (_) => AlertDialog(
+        title: Text(DateFormat('MMMM d, yyyy').format(day)),
         content: SizedBox(
           width: double.maxFinite,
           child: ListView.builder(
             shrinkWrap: true,
             itemCount: events.length,
-            itemBuilder: (context, index) {
-              final event = events[index];
+            itemBuilder: (_, i) {
+              final e = events[i];
               return Card(
-                margin: const EdgeInsets.symmetric(vertical: 4),
                 child: ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: event.color,
-                    child: const Icon(Icons.event, color: Colors.white),
-                  ),
-                  title: Text(
-                    event.title,
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  subtitle: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(event.time),
-                      if (event.description.isNotEmpty)
-                        Text(
-                          event.description,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey[600],
-                          ),
-                        ),
-                    ],
-                  ),
+                  leading: CircleAvatar(backgroundColor: e.color),
+                  title: Text(e.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text("${e.time}\n${e.description}"),
                 ),
               );
             },
           ),
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Close"))
         ],
       ),
     );
@@ -280,70 +227,35 @@ class _CalendarScreenState extends State<CalendarScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Firebase Event Calendar'),
-        centerTitle: true,
-        elevation: 2,
+        title: const Text("Firebase Calendar"),
         actions: [
-          // Show current month and cache info
           IconButton(
-            icon: const Icon(Icons.info_outline),
+            icon: const Icon(Icons.delete),
             onPressed: () {
-              showDialog(
-                context: context,
-                builder: (context) => AlertDialog(
-                  title: const Text('Cache Info'),
-                  content: Text(
-                    'Cached months: ${_monthlyEventsCache.length}\n'
-                    'Current month: ${DateFormat('MMMM yyyy').format(_focusedDay)}\n'
-                    'Events this month: ${_currentMonthEvents.values.fold(0, (sum, list) => sum + list.length)}',
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () {
-                        setState(() {
-                          _monthlyEventsCache.clear();
-                        });
-                        Navigator.pop(context);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Cache cleared')),
-                        );
-                      },
-                      child: const Text('Clear Cache'),
-                    ),
-                    TextButton(
-                      onPressed: () => Navigator.pop(context),
-                      child: const Text('Close'),
-                    ),
-                  ],
-                ),
+              _cache.clear();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Cache Cleared")),
               );
+              _loadMonth(_focusedDay);
             },
-          ),
+          )
         ],
       ),
       body: Column(
         children: [
-          // Calendar Widget
           TableCalendar(
             firstDay: DateTime.utc(2020, 1, 1),
             lastDay: DateTime.utc(2030, 12, 31),
             focusedDay: _focusedDay,
             calendarFormat: _calendarFormat,
-            selectedDayPredicate: (day) {
-              return isSameDay(_selectedDay, day);
-            },
+            selectedDayPredicate: (d) => isSameDay(d, _selectedDay),
+            eventLoader: _eventsForDay,
             onDaySelected: _onDaySelected,
-            onFormatChanged: (format) {
-              setState(() {
-                _calendarFormat = format;
-              });
-            },
-            onPageChanged:
-                _onPageChanged, // This is key for month swipe detection
-            eventLoader: _getEventsForDay,
+            onPageChanged: _onPageChanged,
+            onFormatChanged: (f) => setState(() => _calendarFormat = f),
             calendarStyle: CalendarStyle(
               todayDecoration: BoxDecoration(
-                color: Colors.blue.withOpacity(0.5),
+                color: Colors.blue.withOpacity(.4),
                 shape: BoxShape.circle,
               ),
               selectedDecoration: const BoxDecoration(
@@ -354,10 +266,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
                 color: Colors.red,
                 shape: BoxShape.circle,
               ),
-              markersMaxCount: 1,
+                markersMaxCount: 1,
             ),
             headerStyle: const HeaderStyle(
-              formatButtonVisible: true,
+              formatButtonVisible: false,
               titleCentered: true,
               formatButtonShowsNext: false,
             ),
@@ -420,19 +332,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
   }
 }
 
-// Event model class
 class Event {
-  final String id;
-  final String title;
-  final String time;
+  final String id, title, time, description;
   final Color color;
-  final String description;
-
-  Event({
-    required this.id,
-    required this.title,
-    required this.time,
-    required this.color,
-    required this.description,
-  });
+  Event({required this.id, required this.title, required this.time, required this.color, required this.description});
 }
